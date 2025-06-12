@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>AKAP Image Format</title>
+    <script src="https://cdn.jsdelivr.net/npm/lz-string@1.5.0/libs/lz-string.min.js"></script>
+    <style>
+      * {
+        transition: all 0.1s ease-in-out;
+        user-select: none;
+      }
+
+      body {
+        background: #121212;
+        color: #e0e0e0;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        min-height: 100vh;
+      }
+
+      canvas {
+        border: 2px solid #3a3a3a;
+        border-radius: 8px;
+        margin-bottom: 1.5rem;
+        max-width: 90vw;
+        max-height: 60vh;
+        background: #222;
+      }
+
+      input[type="file"] {
+        display: block;
+        margin: 0.5rem 0 1rem 0;
+        padding: 0.5rem;
+        border-radius: 6px;
+        border: 1.5px solid #555;
+        background: #1e1e1e;
+        color: #ccc;
+        width: 250px;
+        cursor: pointer;
+        transition: border-color 0.3s ease;
+      }
+
+      input[type="file"]:hover,
+      input[type="file"]:focus {
+        border-color: #3bbaff;
+        outline: none;
+        color: #3bbaff;
+      }
+
+      button {
+        cursor: pointer;
+        margin: 0.5rem;
+        padding: 0.6rem 1.4rem;
+        font-weight: 600;
+        font-size: 1rem;
+        border-radius: 8px;
+        border: none;
+        background: #3bbaff;
+        color: white;
+        user-select: none;
+        min-width: 160px;
+      }
+
+      button:hover {
+        box-shadow: 0 0 8px rgba(255, 255, 255, 0.2);
+        transform: scale(1.02);
+      }
+
+      button:active {
+        transform: scale(0.98);
+        background: #2a8fcf;
+        box-shadow: none;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        max-width: 540px;
+        gap: 1rem;
+        margin-bottom: 2rem;
+      }
+
+      h1 {
+        margin-bottom: 1rem;
+        font-weight: 700;
+        color: #3bbaff;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>AKAP Image Format Viewer & Converter</h1>
+    <canvas></canvas>
+    <div class="controls">
+      <div>
+        <label for="AKAPInput" style="display: block; margin-bottom: 0.25rem"
+          >Load AKAP File:</label
+        >
+        <input type="file" id="AKAPInput" accept=".akap" />
+      </div>
+      <div>
+        <label for="imageInput" style="display: block; margin-bottom: 0.25rem"
+          >Load Image File:</label
+        >
+        <input type="file" id="imageInput" accept="image/*" />
+      </div>
+    </div>
+    <div class="controls">
+      <button id="loadAKAP">Display AKAP</button>
+      <button id="loadImage">Convert Image to AKAP</button>
+    </div>
+    <script>
+      const canvas = document.querySelector("canvas");
+      const ctx = canvas.getContext("2d");
+      const AKAPInput = document.getElementById("AKAPInput");
+      const imageInput = document.getElementById("imageInput");
+      const loadAKAPButton = document.getElementById("loadAKAP");
+      const loadImageButton = document.getElementById("loadImage");
+
+      const toHex = (v) => v.toString(16).padStart(2, "0");
+      const isShortHex = (r, g, b) => {
+        return [r, g, b].every((v) => v >> 4 === (v & 0xf));
+      };
+
+      const pixelToHexFormat = (r, g, b, a = 255) => {
+        if (a === 255) {
+          if (isShortHex(r, g, b)) {
+            return `/${(r >> 4).toString(16)}${(g >> 4).toString(16)}${(
+              b >> 4
+            ).toString(16)}`;
+          } else {
+            return `/${toHex(r)}${toHex(g)}${toHex(b)}`;
+          }
+        } else {
+          return `/${toHex(r)}${toHex(g)}${toHex(b)}${toHex(a)}`;
+        }
+      };
+
+      const hexToPixel = (hex) => {
+        let r,
+          g,
+          b,
+          a = 255;
+        if (hex.length === 3) {
+          r = parseInt(hex[0] + hex[0], 16);
+          g = parseInt(hex[1] + hex[1], 16);
+          b = parseInt(hex[2] + hex[2], 16);
+        } else if (hex.length === 6) {
+          r = parseInt(hex.slice(0, 2), 16);
+          g = parseInt(hex.slice(2, 4), 16);
+          b = parseInt(hex.slice(4, 6), 16);
+        } else if (hex.length === 8) {
+          r = parseInt(hex.slice(0, 2), 16);
+          g = parseInt(hex.slice(2, 4), 16);
+          b = parseInt(hex.slice(4, 6), 16);
+          a = parseInt(hex.slice(6, 8), 16);
+        }
+        return [r, g, b, a];
+      };
+
+      function convertToAKAP(imageData) {
+        return new Promise((resolve) => {
+          const img = new Image();
+          img.src = imageData;
+          img.onload = () => {
+            canvas.width = img.width;
+            canvas.height = img.height;
+            ctx.drawImage(img, 0, 0);
+            const imageDataObj = ctx.getImageData(0, 0, img.width, img.height);
+
+            let pixelData = "";
+            let prevHex = null;
+            let runLength = 0;
+
+            const flushRun = () => {
+              if (runLength === 0) return;
+              if (runLength === 1) {
+                pixelData += prevHex;
+              } else {
+                pixelData += `${prevHex}_${runLength}`;
+              }
+              runLength = 0;
+            };
+
+            for (let i = 0; i < imageDataObj.data.length; i += 4) {
+              const r = imageDataObj.data[i];
+              const g = imageDataObj.data[i + 1];
+              const b = imageDataObj.data[i + 2];
+              const a = imageDataObj.data[i + 3];
+
+              const hex = pixelToHexFormat(r, g, b, a);
+
+              if (hex === prevHex) {
+                runLength++;
+              } else {
+                flushRun();
+                prevHex = hex;
+                runLength = 1;
+              }
+            }
+            flushRun();
+
+            const header = `AKAP/${img.width}/${img.height}`;
+            resolve(header + pixelData);
+          };
+        });
+      }
+
+      loadAKAPButton.addEventListener("click", () => {
+        const file = AKAPInput.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const compressedBase64 = e.target.result;
+          const data = LZString.decompressFromBase64(compressedBase64);
+          if (!data || !data.startsWith("AKAP/"))
+            return alert("Invalid or corrupted format");
+
+          const parts = data.split("/").filter(Boolean);
+          const width = parseInt(parts[1]);
+          const height = parseInt(parts[2]);
+          const pixels = parts.slice(3);
+
+          canvas.width = width;
+          canvas.height = height;
+
+          const imgData = ctx.createImageData(width, height);
+          let pixelIndex = 0;
+
+          for (let token of pixels) {
+            let count = 1;
+            if (token.includes("_")) {
+              const [hex, times] = token.split("_");
+              token = hex;
+              count = parseInt(times);
+            }
+            const [r, g, b, a] = hexToPixel(token);
+            for (let i = 0; i < count; i++) {
+              const offset = pixelIndex * 4;
+              imgData.data[offset] = r;
+              imgData.data[offset + 1] = g;
+              imgData.data[offset + 2] = b;
+              imgData.data[offset + 3] = a;
+              pixelIndex++;
+            }
+          }
+          ctx.putImageData(imgData, 0, 0);
+        };
+
+        reader.readAsText(file);
+      });
+
+      loadImageButton.addEventListener("click", () => {
+        const file = imageInput.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+          const AKAPData = await convertToAKAP(e.target.result);
+          const compressedBase64 = LZString.compressToBase64(AKAPData);
+          const blob = new Blob([compressedBase64], {
+            type: "text/plain;charset=utf-8",
+          });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.download = "image.akap";
+          a.href = url;
+          a.click();
+        };
+        reader.readAsDataURL(file);
+      });
+    </script>
+  </body>
+</html>
