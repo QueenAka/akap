@@ -1,180 +1,465 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
-    <title>AKAP Image Format</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <title>AKAP</title>
     <style>
       body {
-        background: #121212;
-        color: #e0e0e0;
-        font-family: sans-serif;
-        margin: 0;
+        font-family: system-ui, Arial, sans-serif;
+        padding: 16px;
         display: flex;
         flex-direction: column;
+        gap: 12px;
+        max-width: 1000px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
         align-items: center;
+        flex-wrap: wrap;
       }
       canvas {
-        border: 2px solid #444;
-        border-radius: 8px;
-        margin: 1rem;
-        background: #222;
-        max-width: 90vw;
-        max-height: 60vh;
+        border: 1px solid #ccc;
+        image-rendering: pixelated;
+        max-width: 100%;
       }
-      input,
-      button {
-        margin: 0.5rem;
-        padding: 0.6rem;
+      pre {
+        background: #fafafa;
+        padding: 8px;
         border-radius: 6px;
-        border: none;
-        background: #3bbaff;
-        color: white;
-        font-weight: bold;
-        cursor: pointer;
+        height: 160px;
+        overflow: auto;
+        white-space: pre-wrap;
       }
     </style>
   </head>
   <body>
-    <h1>AKAP Format Viewer (RLE + Pako Deflate)</h1>
-    <canvas></canvas>
-    <input type="file" id="AKAPInput" accept=".akap" />
-    <input type="file" id="imageInput" accept="image/*" />
-    <button id="loadAKAP">Load AKAP</button>
-    <button id="loadImage">Convert Image to AKAP</button>
-    <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+    <h2>
+      AKAP Encoder / Decoder — Strict (No 0x00 writes; A=0 treated as null)
+    </h2>
+
+    <div class="row">
+      <input type="file" id="imageInput" accept="image/*" />
+      <button id="encodeBtn">Encode image → .akap (zlib level 9)</button>
+    </div>
+
+    <div class="row">
+      <input
+        type="file"
+        id="akapInput"
+        accept=".akap,application/octet-stream" />
+      <button id="decodeBtn">Decode .akap → canvas</button>
+    </div>
+
+    <canvas id="canvas" width="256" height="256"></canvas>
+    <pre id="log" aria-live="polite"></pre>
+
+    <script type="module">
+      const brotli = await import(
+        "https://unpkg.com/brotli-wasm@3.0.0/index.web.js?module"
+      ).then((m) => m.default);
+      await brotli.ready;
+      window.Brotli = brotli;
+    </script>
+
     <script>
-      const canvas = document.querySelector("canvas");
+      const canvas = document.getElementById("canvas");
       const ctx = canvas.getContext("2d");
-      const AKAPInput = document.getElementById("AKAPInput");
       const imageInput = document.getElementById("imageInput");
-      function write24bitInt(num) {
-        return new Uint8Array([
-          (num >> 16) & 0xff,
-          (num >> 8) & 0xff,
-          num & 0xff,
-        ]);
+      const encodeBtn = document.getElementById("encodeBtn");
+      const akapInput = document.getElementById("akapInput");
+      const decodeBtn = document.getElementById("decodeBtn");
+      const logEl = document.getElementById("log");
+
+      function log(...args) {
+        logEl.textContent += args.join(" ") + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
       }
 
-      function read24bitInt(bytes, offset) {
+      function write24BE(n) {
+        if (n < 0 || n > 0xffffff) throw new Error("24-bit out of range");
+        return new Uint8Array([(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]);
+      }
+      function read24BE(bytes, offset) {
         return (
           (bytes[offset] << 16) | (bytes[offset + 1] << 8) | bytes[offset + 2]
         );
       }
 
-      document.getElementById("loadImage").onclick = () => {
-        const file = imageInput.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (e) => {
+      const MASK_PB = 0b01000000;
+      const MASK_A = 0b00001000;
+      const MASK_B = 0b00000100;
+      const MASK_G = 0b00000010;
+      const MASK_R = 0b00000001;
+
+      function buildPT({
+        pb = false,
+        runLenBytes = 0,
+        r = false,
+        g = false,
+        b = false,
+        a = false,
+      }) {
+        if (runLenBytes < 0 || runLenBytes > 3)
+          throw new Error("runLenBytes invalid");
+        let pt = 0;
+
+        if (pb) pt |= MASK_PB;
+        pt |= (runLenBytes & 0b11) << 4;
+        if (a) pt |= MASK_A;
+        if (b) pt |= MASK_B;
+        if (g) pt |= MASK_G;
+        if (r) pt |= MASK_R;
+        return pt;
+      }
+
+      function runLenBytesFor(run) {
+        if (run === 1) return 0;
+        if (run <= 0xff) return 1;
+        if (run <= 0xffff) return 2;
+        if (run <= 0xffffff) return 3;
+        throw new Error("run too large");
+      }
+      function encodeRunBE(run, runLenBytes) {
+        const out = [];
+        for (let i = runLenBytes - 1; i >= 0; i--)
+          out.push((run >> (8 * i)) & 0xff);
+        return out;
+      }
+      function decodeRun(pixelStream, pi, runBits) {
+        if (runBits === 0) return { run: 1, pi };
+        if (runBits === 1) {
+          if (pi >= pixelStream.length)
+            throw new Error("Unexpected EOF: 1-byte run");
+          return { run: pixelStream[pi], pi: pi + 1 };
+        }
+        if (runBits === 2) {
+          if (pi + 1 >= pixelStream.length)
+            throw new Error("Unexpected EOF: 2-byte run");
+          const run = (pixelStream[pi] << 8) | pixelStream[pi + 1];
+          return { run, pi: pi + 2 };
+        }
+
+        if (pi + 2 >= pixelStream.length)
+          throw new Error("Unexpected EOF: 3-byte run");
+        const run =
+          (pixelStream[pi] << 16) |
+          (pixelStream[pi + 1] << 8) |
+          pixelStream[pi + 2];
+        return { run, pi: pi + 3 };
+      }
+
+      function fileToDataURL(file) {
+        return new Promise((res, rej) => {
+          const r = new FileReader();
+          r.onload = () => res(r.result);
+          r.onerror = rej;
+          r.readAsDataURL(file);
+        });
+      }
+      function fileToArrayBuffer(file) {
+        return new Promise((res, rej) => {
+          const r = new FileReader();
+          r.onload = () => res(r.result);
+          r.onerror = rej;
+          r.readAsArrayBuffer(file);
+        });
+      }
+      function loadImageFromDataURL(dataURL) {
+        return new Promise((res, rej) => {
           const img = new Image();
-          img.src = e.target.result;
-          img.onload = () => {
-            const width = img.width;
-            const height = img.height;
-            canvas.width = width;
-            canvas.height = height;
-            ctx.drawImage(img, 0, 0);
-            const data = ctx.getImageData(0, 0, width, height).data;
-            // Build header: "AKAP" + width (3 bytes) + height (3 bytes)
-            const header = new Uint8Array(10);
-            header.set([0x41, 0x4b, 0x41, 0x50], 0); // "AKAP"
-            header.set(write24bitInt(width), 4);
-            header.set(write24bitInt(height), 7);
-            // RLE encode pixels
-            const chunks = [];
-            let i = 0;
-            const pushRun = (count, r, g, b, a) => {
-              chunks.push(count, r, g, b, a);
-            };
+          img.onload = () => res(img);
+          img.onerror = rej;
+          img.src = dataURL;
+        });
+      }
 
-            while (i < data.length) {
-              const r = data[i],
-                g = data[i + 1],
-                b = data[i + 2],
-                a = data[i + 3];
+      encodeBtn.addEventListener("click", async () => {
+        try {
+          log("Encode: start");
+          const f = imageInput.files[0];
+          if (!f) {
+            log("No image selected");
+            return;
+          }
+          const dataURL = await fileToDataURL(f);
+          const img = await loadImageFromDataURL(dataURL);
+          const width = img.width,
+            height = img.height;
+          canvas.width = width;
+          canvas.height = height;
+          ctx.clearRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0);
+          const pixels = ctx.getImageData(0, 0, width, height).data;
+
+          const header = new Uint8Array(11);
+          header.set([0x41, 0x4b, 0x41, 0x50], 0);
+          header.set(write24BE(width), 4);
+          header.set(write24BE(height), 7);
+          header[10] = 0x00;
+
+          const pixelStream = [];
+          const totalPixels = width * height;
+          let pIdx = 0;
+
+          while (pIdx < totalPixels) {
+            const ib = pIdx * 4;
+            const r0 = pixels[ib],
+              g0 = pixels[ib + 1],
+              b0 = pixels[ib + 2],
+              a0 = pixels[ib + 3];
+
+            if (a0 === 0) {
               let run = 1;
-              let j = i + 4;
-              while (
-                j < data.length &&
-                data[j] === r &&
-                data[j + 1] === g &&
-                data[j + 2] === b &&
-                data[j + 3] === a &&
-                run < 255
-              ) {
-                run++;
-                j += 4;
+              while (pIdx + run < totalPixels && run < 0xffffff) {
+                const j = (pIdx + run) * 4;
+                if (pixels[j + 3] === 0) run++;
+                else break;
               }
-
-              pushRun(run, r, g, b, a);
-              i += run * 4;
+              const runLenBytes = runLenBytesFor(run);
+              const pt = buildPT({
+                pb: false,
+                runLenBytes,
+                r: false,
+                g: false,
+                b: false,
+                a: false,
+              });
+              pixelStream.push(pt);
+              if (runLenBytes > 0)
+                pixelStream.push(...encodeRunBE(run, runLenBytes));
+              pIdx += run;
+              continue;
             }
 
-            const pixelBytes = new Uint8Array(chunks);
-            const compressed = pako.deflate(pixelBytes, { level: 9 });
-            const out = new Uint8Array(header.length + compressed.length);
-            out.set(header, 0);
-            out.set(compressed, header.length);
-            const blob = new Blob([out], { type: "application/x-akap-image" });
-            const a = document.createElement("a");
-            a.href = URL.createObjectURL(blob);
-            a.download = "image.akap";
-            a.click();
-          };
-        };
-        reader.readAsDataURL(file);
-      };
+            if (a0 === 255 && r0 === 0 && g0 === 0 && b0 === 0) {
+              let run = 1;
+              while (pIdx + run < totalPixels && run < 0xffffff) {
+                const j = (pIdx + run) * 4;
+                if (
+                  pixels[j + 3] === 255 &&
+                  pixels[j] === 0 &&
+                  pixels[j + 1] === 0 &&
+                  pixels[j + 2] === 0
+                )
+                  run++;
+                else break;
+              }
+              const runLenBytes = runLenBytesFor(run);
+              const pt = buildPT({
+                pb: true,
+                runLenBytes,
+                r: false,
+                g: false,
+                b: false,
+                a: false,
+              });
+              pixelStream.push(pt);
+              if (runLenBytes > 0)
+                pixelStream.push(...encodeRunBE(run, runLenBytes));
+              pIdx += run;
+              continue;
+            }
 
-      document.getElementById("loadAKAP").onclick = () => {
-        const file = AKAPInput.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const buffer = new Uint8Array(e.target.result);
+            const rBit = r0 !== 0;
+            const gBit = g0 !== 0;
+            const bBit = b0 !== 0;
+            const aBit = a0 !== 255 && a0 !== 0;
+
+            let run = 1;
+            while (pIdx + run < totalPixels && run < 0xffffff) {
+              const j = (pIdx + run) * 4;
+              const jr = pixels[j],
+                jg = pixels[j + 1],
+                jb = pixels[j + 2],
+                ja = pixels[j + 3];
+              if (ja === 0) break;
+              if (ja === 255 && jr === 0 && jg === 0 && jb === 0) break;
+              if (jr === r0 && jg === g0 && jb === b0 && ja === a0) run++;
+              else break;
+            }
+
+            const runLenBytes = runLenBytesFor(run);
+            const pt = buildPT({
+              pb: false,
+              runLenBytes,
+              r: rBit,
+              g: gBit,
+              b: bBit,
+              a: aBit,
+            });
+            pixelStream.push(pt);
+            if (runLenBytes > 0)
+              pixelStream.push(...encodeRunBE(run, runLenBytes));
+            if (rBit) pixelStream.push(r0);
+            if (gBit) pixelStream.push(g0);
+            if (bBit) pixelStream.push(b0);
+            if (aBit) pixelStream.push(a0);
+
+            pIdx += run;
+          }
+
+          const pxArr = new Uint8Array(pixelStream);
+          const compressed = Brotli.compress(pxArr, { quality: 11 });
+
+          const out = new Uint8Array(header.length + compressed.length);
+          out.set(header, 0);
+          out.set(compressed, header.length);
+
+          const blob = new Blob([out], { type: "application/x-akap-image" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "image.akap";
+          a.click();
+          URL.revokeObjectURL(a.href);
+
+          log(
+            `Encode finished: ${width}x${height}, uncompressed ${pxArr.length} bytes, compressed ${compressed.length} bytes, total ${out.length} bytes.`
+          );
+        } catch (err) {
+          log("Encode error:", err && err.message ? err.message : String(err));
+        }
+      });
+
+      decodeBtn.addEventListener("click", async () => {
+        try {
+          log("Decode: start");
+          const f = akapInput.files[0];
+          if (!f) {
+            log("No .akap selected");
+            return;
+          }
+          const ab = await fileToArrayBuffer(f);
+          const buf = new Uint8Array(ab);
+
+          if (buf.length < 11) {
+            log("Decode error: file too small");
+            return;
+          }
           if (
-            buffer[0] !== 0x41 ||
-            buffer[1] !== 0x4b ||
-            buffer[2] !== 0x41 ||
-            buffer[3] !== 0x50
+            buf[0] !== 0x41 ||
+            buf[1] !== 0x4b ||
+            buf[2] !== 0x41 ||
+            buf[3] !== 0x50
           ) {
-            alert("Invalid AKAP file: missing magic number");
+            log("Decode error: missing AKAP magic");
             return;
           }
 
-          const width = read24bitInt(buffer, 4);
-          const height = read24bitInt(buffer, 7);
-          // Extract compressed pixel data after 10-byte header
-          const compressedData = buffer.slice(10);
-          // Decompress with pako inflate
-          let pixelData;
+          const width = read24BE(buf, 4);
+          const height = read24BE(buf, 7);
+          const imageType = buf[10];
+          if (imageType !== 0x00)
+            log("Warning: unexpected image type", imageType);
+
+          const compressed = buf.slice(11);
+          let pixelStream;
           try {
-            pixelData = pako.inflate(compressedData);
-          } catch (err) {
-            alert("Failed to decompress AKAP pixel data");
+            pixelStream = Brotli.decompress(compressed);
+          } catch (e) {
+            log(
+              "Decode error: decompress failed:",
+              e && e.message ? e.message : String(e)
+            );
             return;
           }
 
-          const imgData = ctx.createImageData(width, height);
-          let dataIdx = 0;
-          for (let p = 0; p < pixelData.length; p += 5) {
-            const count = pixelData[p];
-            const r = pixelData[p + 1];
-            const g = pixelData[p + 2];
-            const b = pixelData[p + 3];
-            const a = pixelData[p + 4];
-            for (let j = 0; j < count; j++) {
-              imgData.data[dataIdx++] = r;
-              imgData.data[dataIdx++] = g;
-              imgData.data[dataIdx++] = b;
-              imgData.data[dataIdx++] = a;
+          const imgData = new Uint8ClampedArray(width * height * 4);
+          let pi = 0;
+          let di = 0;
+
+          while (di < imgData.length) {
+            if (pi >= pixelStream.length) {
+              log("Decode warning: pixel stream ended early");
+              break;
+            }
+
+            const pt = pixelStream[pi++];
+
+            if ((pt & 0b10000000) !== 0)
+              log("Warning: reserved X bit set in PT");
+
+            const pb = (pt & MASK_PB) !== 0;
+            const runBits = (pt >> 4) & 0b11;
+            const hasA = (pt & MASK_A) !== 0;
+            const hasB = (pt & MASK_B) !== 0;
+            const hasG = (pt & MASK_G) !== 0;
+            const hasR = (pt & MASK_R) !== 0;
+
+            const runRes = decodeRun(pixelStream, pi, runBits);
+            const run = runRes.run;
+            pi = runRes.pi;
+
+            let r = 0,
+              g = 0,
+              b = 0,
+              a = 255;
+
+            if (pb) {
+              if (hasR || hasG || hasB || hasA) {
+                log(
+                  "Decode error: PT indicates pitch-black but component bits are set. Aborting."
+                );
+                return;
+              }
+            } else if (!hasR && !hasG && !hasB && !hasA) {
+              a = 0;
+              r = 0;
+              g = 0;
+              b = 0;
+            } else {
+              if (hasR) {
+                if (pi >= pixelStream.length) {
+                  log("Decode error: unexpected EOF reading R");
+                  return;
+                }
+                r = pixelStream[pi++];
+              }
+              if (hasG) {
+                if (pi >= pixelStream.length) {
+                  log("Decode error: unexpected EOF reading G");
+                  return;
+                }
+                g = pixelStream[pi++];
+              }
+              if (hasB) {
+                if (pi >= pixelStream.length) {
+                  log("Decode error: unexpected EOF reading B");
+                  return;
+                }
+                b = pixelStream[pi++];
+              }
+              if (hasA) {
+                if (pi >= pixelStream.length) {
+                  log("Decode error: unexpected EOF reading A");
+                  return;
+                }
+                a = pixelStream[pi++];
+              } else {
+                a = 255;
+              }
+            }
+
+            for (let k = 0; k < run; k++) {
+              if (di + 3 >= imgData.length) break;
+              imgData[di++] = r;
+              imgData[di++] = g;
+              imgData[di++] = b;
+              imgData[di++] = a;
             }
           }
 
           canvas.width = width;
           canvas.height = height;
-          ctx.putImageData(imgData, 0, 0);
-        };
-        reader.readAsArrayBuffer(file);
-      };
+          ctx.putImageData(new ImageData(imgData, width, height), 0, 0);
+          log(
+            `Decode finished: ${width}x${height}. decompressed ${pixelStream.length} bytes.`
+          );
+        } catch (err) {
+          log("Decode error:", err && err.message ? err.message : String(err));
+        }
+      });
     </script>
   </body>
 </html>
